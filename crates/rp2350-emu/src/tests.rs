@@ -7260,6 +7260,154 @@ fn ldrexh_clrex_strexh_fail() {
     assert_eq!(bus.read16(0x2000_0314, 0), 0xAABB);
 }
 
+// -- LDAEX / STLEX (acquire/release) -----------------------------------------
+//
+// The encodings below are not hand-written: every hw0/hw1 pair is what the Arm
+// GNU toolchain 15.3 emits for that mnemonic at `-mcpu=cortex-m33 -mthumb`,
+// read out of the object file.  They are pinned as literals rather than built
+// by an encoder on purpose — an encoder that shares the decoder's mistake
+// proves nothing, which is exactly how the LDRD mis-decode survived.
+//
+//   LDAEX  r3, [r2]      hw0 = 0xE8D2, hw1 = 0x3FEF
+//   LDAEXB r3, [r2]      hw0 = 0xE8D2, hw1 = 0x3FCF
+//   LDAEXH r3, [r2]      hw0 = 0xE8D2, hw1 = 0x3FDF
+//   STLEX  r0, r1, [r2]  hw0 = 0xE8C2, hw1 = 0x1FE0
+//   STLEXB r0, r1, [r2]  hw0 = 0xE8C2, hw1 = 0x1FC0
+//   STLEXH r0, r1, [r2]  hw0 = 0xE8C2, hw1 = 0x1FD0
+
+#[test]
+fn ldaex_stlex_success() {
+    let (mut c, mut bus) = core_and_bus();
+    bus.write32(0x2000_0400, 0xDEAD_BEEF, 0);
+    c.set_reg(2, 0x2000_0400);
+    c.set_reg(1, 0x1234_5678);
+
+    c.execute_one_wide_with_bus(0xE8D2, 0x3FEF, &mut bus); // LDAEX r3, [r2]
+    assert_eq!(c.reg(3), 0xDEAD_BEEF);
+    assert_eq!(c.exclusive_address, Some(0x2000_0400));
+
+    c.execute_one_wide_with_bus(0xE8C2, 0x1FE0, &mut bus); // STLEX r0, r1, [r2]
+    assert_eq!(c.reg(0), 0, "STLEX success");
+    assert_eq!(bus.read32(0x2000_0400, 0), 0x1234_5678);
+    assert_eq!(c.exclusive_address, None);
+}
+
+#[test]
+fn ldaexb_stlexb_success() {
+    // The SDK's actual pair: `hw_claim_or_assert` ->
+    // `next_striped_spin_lock_num()` is an LDAEXB/STLEXB on the lock byte.
+    let (mut c, mut bus) = core_and_bus();
+    bus.write8(0x2000_0410, 0x01, 0);
+    c.set_reg(2, 0x2000_0410);
+    c.set_reg(1, 0x03);
+
+    c.execute_one_wide_with_bus(0xE8D2, 0x3FCF, &mut bus); // LDAEXB r3, [r2]
+    assert_eq!(c.reg(3), 0x01, "LDAEXB zero-extends the byte");
+    assert_eq!(c.exclusive_address, Some(0x2000_0410));
+
+    c.execute_one_wide_with_bus(0xE8C2, 0x1FC0, &mut bus); // STLEXB r0, r1, [r2]
+    assert_eq!(c.reg(0), 0, "STLEXB success");
+    assert_eq!(bus.read8(0x2000_0410, 0), 0x03);
+    assert_eq!(c.exclusive_address, None);
+}
+
+#[test]
+fn ldaexh_stlexh_success() {
+    let (mut c, mut bus) = core_and_bus();
+    bus.write16(0x2000_0420, 0x0A0B, 0);
+    c.set_reg(2, 0x2000_0420);
+    c.set_reg(1, 0xF00D);
+
+    c.execute_one_wide_with_bus(0xE8D2, 0x3FDF, &mut bus); // LDAEXH r3, [r2]
+    assert_eq!(c.reg(3), 0x0A0B);
+    assert_eq!(c.exclusive_address, Some(0x2000_0420));
+
+    c.execute_one_wide_with_bus(0xE8C2, 0x1FD0, &mut bus); // STLEXH r0, r1, [r2]
+    assert_eq!(c.reg(0), 0, "STLEXH success");
+    assert_eq!(bus.read16(0x2000_0420, 0), 0xF00D);
+}
+
+#[test]
+fn ldaexb_is_not_decoded_as_ldrd() {
+    // THE REGRESSION THIS WHOLE FAMILY EXISTS FOR.
+    //
+    // Before LDAEX was decoded, `LDAEXB` fell through to the LDRD/STRD path: its
+    // hw1 low nibble is 0xF, so the fall-through read `Rt2 = 15` and executed
+    // `LDRD {r3, pc}` — loading the PC out of the memory it was supposed to be
+    // sampling a lock byte from.  On the SDK that showed up as the core jumping
+    // into the mask ROM's vector table and dying of a precise BusFault.
+    //
+    // The fixture makes the two decodes impossible to confuse: the byte and the
+    // word at the same address are deliberately different values, so a wrong
+    // decode is not "a byte with the wrong width", it is a completely different
+    // number.  The monitor check is the second half of the proof — an LDRD never
+    // arms it.
+    let (mut c, mut bus) = core_and_bus();
+    bus.write32(0x2000_0430, 0xBBCC_DDAA, 0);
+    c.set_reg(2, 0x2000_0430);
+    let pc_before = c.regs.pc();
+
+    c.execute_one_wide_with_bus(0xE8D2, 0x3FCF, &mut bus); // LDAEXB r3, [r2]
+
+    assert_eq!(
+        c.reg(3),
+        0xAA,
+        "LDAEXB must zero-extend the byte, not load the 32-bit word 0xBBCCDDAA \
+         (which is what the LDRD mis-decode did)"
+    );
+    assert_eq!(
+        c.exclusive_address,
+        Some(0x2000_0430),
+        "LDAEXB must arm the local exclusive monitor; the LDRD mis-decode never did"
+    );
+    assert_eq!(
+        c.regs.pc(),
+        pc_before.wrapping_add(4),
+        "the LDRD mis-decode loaded the PC from memory; the PC must simply advance"
+    );
+}
+
+#[test]
+fn stlex_without_monitor_fails() {
+    // A store-exclusive with nothing armed must fail and must not write.
+    let (mut c, mut bus) = core_and_bus();
+    bus.write32(0x2000_0440, 0xAAAA_AAAA, 0);
+    c.set_reg(2, 0x2000_0440);
+    c.set_reg(1, 0x5555_5555);
+    assert_eq!(c.exclusive_address, None);
+
+    c.execute_one_wide_with_bus(0xE8C2, 0x1FE0, &mut bus); // STLEX r0, r1, [r2]
+
+    assert_eq!(
+        c.reg(0),
+        1,
+        "STLEX with no armed monitor must report failure"
+    );
+    assert_eq!(bus.read32(0x2000_0440, 0), 0xAAAA_AAAA, "memory unchanged");
+}
+
+#[test]
+fn ldaex_stlex_addr_mismatch_fails() {
+    // Armed on one address, stored to another: the store must fail.
+    let (mut c, mut bus) = core_and_bus();
+    bus.write32(0x2000_0450, 0x1111_1111, 0);
+    bus.write32(0x2000_0460, 0x2222_2222, 0);
+    c.set_reg(1, 0x3333_3333);
+
+    c.set_reg(2, 0x2000_0450);
+    c.execute_one_wide_with_bus(0xE8D2, 0x3FEF, &mut bus); // LDAEX r3, [r2]
+    assert_eq!(c.exclusive_address, Some(0x2000_0450));
+
+    c.set_reg(2, 0x2000_0460);
+    c.execute_one_wide_with_bus(0xE8C2, 0x1FE0, &mut bus); // STLEX r0, r1, [r2]
+    assert_eq!(c.reg(0), 1, "address mismatch must fail");
+    assert_eq!(bus.read32(0x2000_0460, 0), 0x2222_2222, "memory unchanged");
+    assert_eq!(
+        c.exclusive_address, None,
+        "STLEX clears the monitor either way"
+    );
+}
+
 // ============================================================================
 // MSPLIM / PSPLIM via MSR/MRS
 // ============================================================================
@@ -19195,109 +19343,180 @@ mod stage7_coprocessor_coverage {
         assert!(cpu.pending_fault.is_none());
     }
 
-    // CP0 LO_OUT bulk MRC with op2 != 0 (returns 0).
+    // --- CP0: `opc1` is the operation, `CRm` selects the register -----------
+    //
+    // These replaced a block that read `opc1` as the bank and `op2` as the
+    // operation.  Five of the eight it replaced passed for reasons unrelated to
+    // what they claimed, which is what a self-consistent-but-wrong decode looks
+    // like from the inside of a test suite.  Every encoding below is the SDK's
+    // own form, read out of `arm-none-eabi-objdump` for
+    // `-mcpu=cortex-m33 -mthumb`.
+
+    /// MRC with `opc1 = 0` reads the register `CRm` selects: `c0` LO OUT,
+    /// `c4` LO OE, `c8` LO IN.  `op2` is not part of the operation.
     #[test]
-    fn cp0_lo_out_bulk_mrc_unknown_op2_returns_zero() {
+    fn cp0_mrc_reads_select_the_register_by_crm() {
         let (mut cpu, mut bus) = make_env();
         enable_cp(&mut cpu, 0);
         bus.sio.gpio_out = 0x1234;
-        // MRC CP0, opc1=0, CRn=0, Rt=3, op2=2 (unknown), CRm=0.
-        let hw0: u16 = 0xEE10; // L=1
-        let hw1: u16 = (3u16 << 12) | (2u16 << 5) | 0x10;
-        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
-        assert_eq!(cpu.regs.r[3], 0);
+        bus.sio.gpio_oe = 0x00FF;
+        bus.gpio_in
+            .store(0xABCD, std::sync::atomic::Ordering::Relaxed);
+
+        // mrc p0, #0, r3, c0, c0 -> LO OUT
+        cpu.thumb32_coprocessor(0xEE10, (3u16 << 12) | 0x10, &mut bus);
+        assert_eq!(cpu.regs.r[3], 0x1234);
+
+        // mrc p0, #0, r4, c0, c4 -> LO OE
+        cpu.thumb32_coprocessor(0xEE10, (4u16 << 12) | 0x14, &mut bus);
+        assert_eq!(cpu.regs.r[4], 0x00FF);
+
+        // mrc p0, #0, r5, c0, c8 -> LO IN  (gpio_get_all)
+        cpu.thumb32_coprocessor(0xEE10, (5u16 << 12) | 0x18, &mut bus);
+        assert_eq!(cpu.regs.r[5], 0xABCD);
     }
 
-    // CP0 LO_OUT bulk MCR with op2 = 0..3 (put/set/clr/xor), then op2>=4 (ignored).
+    /// MCR `opc1` 0/1/2/3 = put/xor/set/clr on the register `CRm` selects.
     #[test]
-    fn cp0_lo_out_bulk_mcr_unknown_op2_ignored() {
+    fn cp0_mcr_opc1_is_the_operation() {
         let (mut cpu, mut bus) = make_env();
         enable_cp(&mut cpu, 0);
+        cpu.regs.r[1] = 0x0AAA;
+
+        // mcr p0, #0, r1, c0, c0 -> put (gpio_put_all)
         bus.sio.gpio_out = 0x0F0F;
-        cpu.regs.r[1] = 0xAAAA;
-        // MCR CP0, opc1=0, CRn=0, Rt=1, op2=5 (unknown), CRm=0.
-        let hw0: u16 = 0xEE00;
-        let hw1: u16 = (1u16 << 12) | (5u16 << 5) | 0x10;
-        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
-        // gpio_out unchanged.
-        assert_eq!(bus.sio.gpio_out, 0x0F0F);
+        cpu.thumb32_coprocessor(0xEE00, (1u16 << 12) | 0x10, &mut bus);
+        assert_eq!(bus.sio.gpio_out, 0x0AAA);
+
+        // mcr p0, #1, r1, c0, c0 -> xor
+        cpu.thumb32_coprocessor(0xEE20, (1u16 << 12) | 0x10, &mut bus);
+        assert_eq!(bus.sio.gpio_out, 0);
+
+        // mcr p0, #2, r1, c0, c0 -> set (gpio_set_mask)
+        cpu.thumb32_coprocessor(0xEE40, (1u16 << 12) | 0x10, &mut bus);
+        assert_eq!(bus.sio.gpio_out, 0x0AAA);
+
+        // mcr p0, #3, r1, c0, c0 -> clr (gpio_clr_mask)
+        cpu.thumb32_coprocessor(0xEE60, (1u16 << 12) | 0x10, &mut bus);
+        assert_eq!(bus.sio.gpio_out, 0);
     }
 
-    // CP0 LO_OE bulk MRC unknown op2 returns 0.
+    /// The OE bank is `CRm = c4`: `opc1 = 2` there is
+    /// `gpio_set_dir_out_masked`.
     #[test]
-    fn cp0_lo_oe_bulk_mrc_unknown_op2() {
+    fn cp0_mcr_oe_bank_is_crm_c4() {
         let (mut cpu, mut bus) = make_env();
         enable_cp(&mut cpu, 0);
-        bus.sio.gpio_oe = 0x1234;
-        // MRC CP0, opc1=1, CRn=0, Rt=4, op2=1 (unknown), CRm=0.
-        let hw0: u16 = 0xEE30; // opc1=1, L=1
-        let hw1: u16 = (4u16 << 12) | (1u16 << 5) | 0x10;
-        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
-        assert_eq!(cpu.regs.r[4], 0);
+        cpu.regs.r[1] = 0x00F0;
+        // mcr p0, #2, r1, c0, c4
+        cpu.thumb32_coprocessor(0xEE40, (1u16 << 12) | 0x14, &mut bus);
+        assert_eq!(bus.sio.gpio_oe, 0x00F0);
+        assert_eq!(bus.sio.gpio_out, 0, "the OUT bank is untouched");
     }
 
-    // CP0 LO_OE bulk MCR unknown op2 (ignored).
+    /// The single-bit MCR forms put the pin number in `Rt` and are
+    /// unconditional: `mcr p0, #6, Rt, c0, c0` is `gpioc_bit_out_set`.
     #[test]
-    fn cp0_lo_oe_bulk_mcr_unknown_op2() {
+    fn cp0_mcr_single_bit_forms_use_rt_as_the_pin() {
         let (mut cpu, mut bus) = make_env();
         enable_cp(&mut cpu, 0);
-        bus.sio.gpio_oe = 0x0F0F;
-        cpu.regs.r[1] = 0xAAAA;
-        let hw0: u16 = 0xEE20; // opc1=1, L=0
-        let hw1: u16 = (1u16 << 12) | (5u16 << 5) | 0x10;
-        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
-        assert_eq!(bus.sio.gpio_oe, 0x0F0F);
+        cpu.regs.r[1] = 12;
+
+        cpu.thumb32_coprocessor(0xEEC0, (1u16 << 12) | 0x10, &mut bus); // set
+        assert_eq!(bus.sio.gpio_out, 1 << 12);
+        cpu.thumb32_coprocessor(0xEEE0, (1u16 << 12) | 0x10, &mut bus); // clr
+        assert_eq!(bus.sio.gpio_out, 0);
+        cpu.thumb32_coprocessor(0xEEA0, (1u16 << 12) | 0x10, &mut bus); // xor
+        assert_eq!(bus.sio.gpio_out, 1 << 12);
     }
 
-    // CP0 LO_IN with MCR (silent NOP).
+    /// A write to an IN register is undefined and is a silent NOP.
     #[test]
-    fn cp0_lo_in_mcr_is_silent_nop() {
+    fn cp0_write_to_an_in_register_is_silent_nop() {
         let (mut cpu, mut bus) = make_env();
         enable_cp(&mut cpu, 0);
-        cpu.regs.r[1] = 0x1234;
-        // MCR CP0, opc1=2, CRn=0, CRm=0 — MCR to IN bank, silent NOP.
-        let hw0: u16 = 0xEE40; // opc1=2, L=0
-        let hw1: u16 = (1u16 << 12) | 0x10;
-        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
-        // Nothing changes.
-        assert!(cpu.pending_fault.is_none());
-    }
-
-    // HI banks (opc1 = 4, 5, 6): MRC returns 0, MCR is a no-op.
-    #[test]
-    fn cp0_hi_bank_mrc_returns_zero() {
-        let (mut cpu, mut bus) = make_env();
-        enable_cp(&mut cpu, 0);
-        cpu.regs.r[2] = 0xFFFF_FFFF;
-        // opc1=4 (HI OUT) MRC
-        let hw0: u16 = 0xEE90;
-        let hw1: u16 = (2u16 << 12) | 0x10;
-        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
-        assert_eq!(cpu.regs.r[2], 0);
-    }
-
-    #[test]
-    fn cp0_hi_bank_mcr_is_noop() {
-        let (mut cpu, mut bus) = make_env();
-        enable_cp(&mut cpu, 0);
-        cpu.regs.r[2] = 0xFFFF_FFFF;
-        // opc1=5 (HI OE) MCR
-        let hw0: u16 = 0xEEA0;
-        let hw1: u16 = (2u16 << 12) | 0x10;
-        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        cpu.regs.r[1] = 0xFFFF_FFFF;
+        // mcr p0, #0, r1, c0, c8
+        cpu.thumb32_coprocessor(0xEE00, (1u16 << 12) | 0x18, &mut bus);
+        assert_eq!(bus.sio.gpio_out, 0);
         assert_eq!(bus.sio.gpio_oe, 0);
+        assert!(cpu.pending_fault.is_none());
     }
 
-    // CP0 unknown opc1 (3, 7): silent NOP.
+    /// Bank 1 is `CRm` `c1`/`c5`/`c9`: reads are RAZ and writes are WI, because
+    /// this crate's SIO models bank 0 only.  That is the GP32-47 gap, and it is
+    /// a different defect from the encoding -- the access reaches the right
+    /// register, and the register does not exist yet.
     #[test]
-    fn cp0_unknown_opc1_silent_nop() {
+    fn cp0_hi_bank_reads_zero_and_writes_nothing() {
         let (mut cpu, mut bus) = make_env();
         enable_cp(&mut cpu, 0);
-        // opc1=3 (unknown)
-        let hw0: u16 = 0xEE60;
-        let hw1: u16 = 0x10;
-        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        bus.sio.gpio_out = 0xFFFF;
+        bus.sio.gpio_oe = 0xFFFF;
+
+        // mrc p0, #0, r2, c0, c1 -> HI OUT
+        cpu.thumb32_coprocessor(0xEE10, (2u16 << 12) | 0x11, &mut bus);
+        assert_eq!(cpu.regs.r[2], 0);
+
+        // mcr p0, #0, r3, c0, c1 -> HI OUT write
+        cpu.regs.r[3] = 0xFFFF_FFFF;
+        cpu.thumb32_coprocessor(0xEE00, (3u16 << 12) | 0x11, &mut bus);
+        assert_eq!(bus.sio.gpio_out, 0xFFFF, "bank 0 is untouched");
+
+        // mcr p0, #2, r3, c0, c5 -> HI OE set
+        cpu.thumb32_coprocessor(0xEE40, (3u16 << 12) | 0x15, &mut bus);
+        assert_eq!(bus.sio.gpio_oe, 0xFFFF, "bank 0 OE is untouched");
+    }
+
+    /// A `CRm` that selects no register (`c2`, `c3`, `c6`, ...) is a silent NOP.
+    #[test]
+    fn cp0_unselected_crm_is_silent_nop() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 0);
+        bus.sio.gpio_out = 0x1234;
+        cpu.regs.r[1] = 0xFFFF_FFFF;
+        // mcr p0, #0, r1, c0, c2
+        cpu.thumb32_coprocessor(0xEE00, (1u16 << 12) | 0x12, &mut bus);
+        assert_eq!(bus.sio.gpio_out, 0x1234);
         assert!(cpu.pending_fault.is_none());
+    }
+
+    /// MCR `opc1 = 4` is neither a mask form (0-3) nor a single-bit form (5-7):
+    /// silent NOP.
+    #[test]
+    fn cp0_mcr_opc1_four_is_silent_nop() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 0);
+        bus.sio.gpio_out = 0x1234;
+        cpu.regs.r[1] = 0xFFFF_FFFF;
+        cpu.thumb32_coprocessor(0xEE80, (1u16 << 12) | 0x10, &mut bus);
+        assert_eq!(bus.sio.gpio_out, 0x1234);
+        assert!(cpu.pending_fault.is_none());
+    }
+
+    /// **The MCRR family**, which this crate did not decode at all.  The SDK's
+    /// `gpio_put()` and `gpio_set_dir()` live here, so a firmware that used
+    /// either got a silent NOP for the whole run.
+    #[test]
+    fn cp0_mcrr_bit_out_put_is_gpio_put() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 0);
+        cpu.regs.r[1] = 7; // pin
+        cpu.regs.r[2] = 1; // value
+        // mcrr p0, #4, r1, r2, c0
+        cpu.thumb32_coprocessor(0xEC42, (1u16 << 12) | 0x40, &mut bus);
+        assert_eq!(bus.sio.gpio_out, 1 << 7);
+    }
+
+    #[test]
+    fn cp0_mcrr_bit_oe_put_is_gpio_set_dir() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 0);
+        cpu.regs.r[1] = 12; // pin
+        cpu.regs.r[2] = 1; // out
+        // mcrr p0, #4, r1, r2, c4
+        cpu.thumb32_coprocessor(0xEC42, (1u16 << 12) | 0x44, &mut bus);
+        assert_eq!(bus.sio.gpio_oe, 1 << 12);
     }
 
     // CP4/5 DCP CDP: all arithmetic, compare, convert, status ops.
