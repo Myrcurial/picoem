@@ -240,8 +240,12 @@ impl CortexM33 {
         conditional: bool,
         oe: bool,
     ) {
-        if pin >= 30 {
-            return; // outside the modelled bank (Sio::PIN_MASK) -> RAZ/WI
+        // The same bank-0 width the SIO uses, from the same constant -- this guard
+        // is where `gpio_set_dir(gpio, out)` lands (`gpioc_bit_oe_put`), so a wrong
+        // number here is a `gpio_set_dir` that silently does nothing for a pin the
+        // SIO itself would have accepted.
+        if pin >= u32::from(Sio::BANK0_PINS) {
+            return; // outside bank 0 -> RAZ/WI
         }
         let mask = 1u32 << pin;
         let on = val & 1 != 0;
@@ -1155,6 +1159,41 @@ mod tests {
         let (hw0, hw1) = encode_mcrr_full(0, 4, 1, 2, 0x4, false);
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
         assert_eq!(bus.sio.gpio_oe, 0, "gpio_set_dir(pin, false) is an input");
+    }
+
+    /// The same form at the top of bank 0, which is where the interposer's shift
+    /// fabric lives: `gpio_set_dir(30, OUT)` is `SR_RCK` and `gpio_set_dir(31, OUT)`
+    /// is `/OE_ADDR`.
+    ///
+    /// Both were **silent no-ops** while bank 0 was modelled as 30 pins, and no test
+    /// above pin 29 existed to say so — a firmware that shifted a match value into
+    /// the '595 and latched it appeared to have done neither. Measured: the bridge
+    /// counted all 8 of the firmware's `SR_SCK` edges and **0 latches**.
+    #[test]
+    fn test_cp0_gpio_set_dir_reaches_30_and_31() {
+        let mut cpu = CortexM33::for_test(0);
+        let mut bus = Bus::default();
+        enable_cp(&mut cpu, 0);
+
+        for pin in [30u32, 31] {
+            cpu.regs.r[1] = pin;
+            cpu.regs.r[2] = 1;
+            let (hw0, hw1) = encode_mcrr_full(0, 4, 1, 2, 0x4, false);
+            cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+            assert_ne!(
+                bus.sio.gpio_oe & (1u32 << pin),
+                0,
+                "gpio_set_dir({pin}, true) must set OE bit {pin}"
+            );
+        }
+        assert_eq!(bus.sio.gpio_oe, 0xC000_0000, "pins 30 and 31, and nothing else");
+
+        // And pin 32 is still outside bank 0.
+        cpu.regs.r[1] = 32;
+        cpu.regs.r[2] = 1;
+        let (hw0, hw1) = encode_mcrr_full(0, 4, 1, 2, 0x4, false);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(bus.sio.gpio_oe, 0xC000_0000, "pin 32 is not in bank 0");
     }
 
     /// The MCRR `*2` forms act only when the value's bit 0 is set -- the one
