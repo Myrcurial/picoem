@@ -876,6 +876,95 @@ impl CortexM33 {
             self.exclusive_address = None;
             return 2;
         }
+        // LDAEX/LDAEXB/LDAEXH and STLEX/STLEXB/STLEXH — the ARMv8-M
+        // acquire/release exclusive forms.  The plain LDREX/STREX forms above are
+        // only one half of the family; the SDK's `hw_claim_or_assert` ->
+        // `next_striped_spin_lock_num()` path uses the *acquire/release* ones, so
+        // without these a stock Pico SDK firmware does not merely lose a spin
+        // lock — it mis-executes.
+        //
+        // Encodings measured, not transcribed: assembled with the Arm GNU
+        // toolchain 15.3 (`-mcpu=cortex-m33 -mthumb`) and read out of the object
+        // file, because every one of them is a *plausible* other instruction and
+        // a table with one wrong nibble fails silently.
+        //
+        //   LDAEX  Rt, [Rn]      hw0 = 0xE8D0 | Rn, hw1[11:4] = 0xFE, hw1[3:0] = 0xF
+        //   LDAEXB Rt, [Rn]      hw0 = 0xE8D0 | Rn, hw1[11:4] = 0xFC, hw1[3:0] = 0xF
+        //   LDAEXH Rt, [Rn]      hw0 = 0xE8D0 | Rn, hw1[11:4] = 0xFD, hw1[3:0] = 0xF
+        //   STLEX  Rd, Rt, [Rn]  hw0 = 0xE8C0 | Rn, hw1[11:4] = 0xFE, hw1[3:0] = Rd
+        //   STLEXB Rd, Rt, [Rn]  hw0 = 0xE8C0 | Rn, hw1[11:4] = 0xFC, hw1[3:0] = Rd
+        //   STLEXH Rd, Rt, [Rn]  hw0 = 0xE8C0 | Rn, hw1[11:4] = 0xFD, hw1[3:0] = Rd
+        //
+        // Why they must be decoded *here*, before the LDRD/STRD fall-through, and
+        // why the bug this fixes was so hard to read: an unhandled LDAEX is not an
+        // unknown instruction, it is a valid LDRD.  `LDAEXB`'s hw1 low nibble is
+        // 0xF, so the fall-through sees `Rt2 = 15` and performs `LDRD {Rt, pc}` —
+        // the core loads its own PC out of the lock byte it was reading and jumps
+        // there.  Measured on the SDK: PC 0x1000041e -> 0x00000000, then the mask
+        // ROM's vector table executed two bytes at a time until a precise BusFault
+        // escalated to HardFault.
+        //
+        // Intercepting `hw1[11:8] == 0xF` on hw0 = 0xE8Cx/0xE8Dx is safe for the
+        // same reason the LDREXB/LDREXH blocks above are: it steals only an
+        // LDRD/STRD whose Rt2 is the PC, and `Rt2 = PC` is architecturally
+        // UNPREDICTABLE — no assembler emits it.
+        //
+        // Monitor semantics match the plain forms: the word forms track the exact
+        // address, the byte/halfword forms track the containing word, so an
+        // LDAEXB/STLEXB pair at the same byte offset round-trips.
+        if hw0 & 0xFFF0 == 0xE8D0 && hw1 & 0xF == 0xF {
+            let size = (hw1 >> 4) & 0xFF;
+            if (0xFC..=0xFE).contains(&size) {
+                let rn = (hw0 & 0xF) as usize;
+                let rt = ((hw1 >> 12) & 0xF) as usize;
+                let addr = self.regs.r[rn];
+                match size {
+                    0xFE => {
+                        // LDAEX — word, no offset form
+                        self.regs.r[rt] = self.bus_read32(addr, bus);
+                        self.exclusive_address = Some(addr);
+                    }
+                    0xFC => {
+                        // LDAEXB
+                        self.regs.r[rt] = self.bus_read8(addr, bus) as u32;
+                        self.exclusive_address = Some(addr & !3);
+                    }
+                    _ => {
+                        // LDAEXH
+                        self.regs.r[rt] = self.bus_read16(addr, bus) as u32;
+                        self.exclusive_address = Some(addr & !3);
+                    }
+                }
+                return 2;
+            }
+        }
+        if hw0 & 0xFFF0 == 0xE8C0 {
+            let size = (hw1 >> 4) & 0xFF;
+            if (0xFC..=0xFE).contains(&size) {
+                let rn = (hw0 & 0xF) as usize;
+                let rt = ((hw1 >> 12) & 0xF) as usize;
+                let rd = (hw1 & 0xF) as usize;
+                let addr = self.regs.r[rn];
+                let hit = if size == 0xFE {
+                    self.exclusive_address == Some(addr)
+                } else {
+                    self.exclusive_address == Some(addr & !3)
+                };
+                if hit {
+                    match size {
+                        0xFE => self.bus_write32(addr, self.regs.r[rt], bus),
+                        0xFC => self.bus_write8(addr, self.regs.r[rt] as u8, bus),
+                        _ => self.bus_write16(addr, self.regs.r[rt] as u16, bus),
+                    }
+                    self.regs.r[rd] = 0;
+                } else {
+                    self.regs.r[rd] = 1;
+                }
+                self.exclusive_address = None;
+                return 2;
+            }
+        }
+
         // (Falls through to LDRD/STRD for any other unrecognized pattern)
 
         // LDRD/STRD (immediate): default path
