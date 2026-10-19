@@ -1042,7 +1042,7 @@ mod tests {
 
         assert_eq!(
             cpu.regs.r[3],
-            0xA5A5_A5A5 & 0x3FFF_FFFF,
+            0xA5A5_A5A5,
             "gpio_get_all reads the input bank, not pin 8 of the output bank"
         );
     }
@@ -1080,11 +1080,11 @@ mod tests {
         cpu.regs.r[0] = 0xDEAD_BEEF;
         let (hw0, hw1) = encode_mcr_full(0, 2, 0, 0, 0, 0x4);
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
-        assert_eq!(bus.sio.gpio_oe, 0xDEAD_BEEF & 0x3FFF_FFFF);
+        assert_eq!(bus.sio.gpio_oe, 0xDEAD_BEEF);
 
         let (hw0, hw1) = encode_mrc_full(0, 0, 0, 1, 0, 0x4);
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
-        assert_eq!(cpu.regs.r[1], 0xDEAD_BEEF & 0x3FFF_FFFF);
+        assert_eq!(cpu.regs.r[1], 0xDEAD_BEEF);
     }
 
     /// `gpio_set_dir_all_bits(values)` = `gpioc_lo_oe_put` = `mcr p0, #0, Rt, c0, c4`.

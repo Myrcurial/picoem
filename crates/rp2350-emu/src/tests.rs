@@ -19011,18 +19011,29 @@ mod stage7_sio_coverage {
     }
 
     #[test]
-    fn gpio_bit_out_masked_at_or_above_30() {
+    fn gpio_bit_out_real_at_30_and_31_masked_at_or_above_32() {
         let mut sio = Sio::new();
-        // get returns false for pin >= 30
-        assert!(!sio.gpio_bit_out_get(30));
-        assert!(!sio.gpio_bit_out_get(31));
-        // put / set / clr / xor are no-ops for pin >= 30
-        let snap = sio.gpio_out;
-        sio.gpio_bit_out_put(30, true);
-        sio.gpio_bit_out_put(31, true);
+        // The B part's bank 0 is 32 pins, so 30 and 31 are **real pins** -- they
+        // are the two a 30-pin SIO masked away, and on the interposer they are the
+        // shift fabric's SR_RCK and /OE_ADDR. This is the positive half of the
+        // change: before it, these two calls were silent no-ops.
         sio.gpio_bit_out_set(30);
-        sio.gpio_bit_out_clr(30);
-        sio.gpio_bit_out_xor(30);
+        assert!(sio.gpio_bit_out_get(30));
+        sio.gpio_bit_out_set(31);
+        assert!(sio.gpio_bit_out_get(31));
+        sio.gpio_bit_out_clr(31);
+        assert!(!sio.gpio_bit_out_get(31));
+
+        // get returns false for pin >= 32
+        assert!(!sio.gpio_bit_out_get(32));
+        assert!(!sio.gpio_bit_out_get(33));
+        // put / set / clr / xor are no-ops for pin >= 32
+        let snap = sio.gpio_out;
+        sio.gpio_bit_out_put(32, true);
+        sio.gpio_bit_out_put(33, true);
+        sio.gpio_bit_out_set(32);
+        sio.gpio_bit_out_clr(32);
+        sio.gpio_bit_out_xor(32);
         assert_eq!(sio.gpio_out, snap);
     }
 
@@ -19044,15 +19055,24 @@ mod stage7_sio_coverage {
     }
 
     #[test]
-    fn gpio_bit_oe_masked_at_or_above_30() {
+    fn gpio_bit_oe_real_at_30_and_31_masked_at_or_above_32() {
         let mut sio = Sio::new();
-        assert!(!sio.gpio_bit_oe_get(30));
-        let snap = sio.gpio_oe;
-        sio.gpio_bit_oe_put(30, true);
-        sio.gpio_bit_oe_put(31, true);
+        // Same as the OUT test above, for the output-enable bank: 30 and 31 are
+        // real pins on the B part, and pin 31 is the interposer's /OE_ADDR.
         sio.gpio_bit_oe_set(30);
-        sio.gpio_bit_oe_clr(30);
-        sio.gpio_bit_oe_xor(30);
+        assert!(sio.gpio_bit_oe_get(30));
+        sio.gpio_bit_oe_set(31);
+        assert!(sio.gpio_bit_oe_get(31));
+        sio.gpio_bit_oe_clr(31);
+        assert!(!sio.gpio_bit_oe_get(31));
+
+        assert!(!sio.gpio_bit_oe_get(32));
+        let snap = sio.gpio_oe;
+        sio.gpio_bit_oe_put(32, true);
+        sio.gpio_bit_oe_put(33, true);
+        sio.gpio_bit_oe_set(32);
+        sio.gpio_bit_oe_clr(32);
+        sio.gpio_bit_oe_xor(32);
         assert_eq!(sio.gpio_oe, snap);
     }
 

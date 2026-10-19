@@ -249,23 +249,34 @@ impl Sio {
     // `gpio_bit_in_get` method is provided here — CP0 reads `bus.gpio_in`
     // directly.
     //
-    // RP2354A target: 30 pins. Bits [31:30] are masked on writes and read
-    // back as zero. The `PIN_MASK` constant encodes this.
+    // **32 bank-0 pins, not the A part's 30.** The B part has 48 GPIOs and this
+    // crate models it everywhere else -- `Emulator::read_all_gpio` returns a
+    // 48-bit physical mask -- so bits [31:30] are real pins here, and masking
+    // them away made GP30 and GP31 undrivable *and* unreadable through every SIO
+    // path. That is two of the interposer's five shift-fabric pins (`SR_RCK` and
+    // `/OE_ADDR`), and it failed as a zero, which reads like a firmware bug.
+    //
+    // `PIN_MASK` encodes the bank-0 width and `BANK0_PINS` is the guard the
+    // per-bit methods use, so the number lives in one place. Bank 1 (GPIO32-47)
+    // is still not modelled here: there are no GPIO_HI_* registers in this SIO.
 
-    /// Mask of valid GPIO pin bits for RP2354A (30 pins, bits [29:0]).
-    pub(crate) const PIN_MASK: u32 = 0x3FFF_FFFF;
+    /// GPIO pins in bank 0 on this part.
+    pub(crate) const BANK0_PINS: u8 = 32;
+
+    /// Mask of valid bank-0 GPIO bits.
+    pub(crate) const PIN_MASK: u32 = u32::MAX;
 
     // Per-bit output (GPIO_OUT) operations.
 
     pub fn gpio_bit_out_get(&self, pin: u8) -> bool {
-        if pin >= 30 {
+        if pin >= Self::BANK0_PINS {
             return false;
         }
         (self.gpio_out >> pin) & 1 != 0
     }
 
     pub fn gpio_bit_out_put(&mut self, pin: u8, v: bool) {
-        if pin >= 30 {
+        if pin >= Self::BANK0_PINS {
             return;
         }
         let mask = 1u32 << pin;
@@ -277,21 +288,21 @@ impl Sio {
     }
 
     pub fn gpio_bit_out_set(&mut self, pin: u8) {
-        if pin >= 30 {
+        if pin >= Self::BANK0_PINS {
             return;
         }
         self.gpio_out |= 1u32 << pin;
     }
 
     pub fn gpio_bit_out_clr(&mut self, pin: u8) {
-        if pin >= 30 {
+        if pin >= Self::BANK0_PINS {
             return;
         }
         self.gpio_out &= !(1u32 << pin);
     }
 
     pub fn gpio_bit_out_xor(&mut self, pin: u8) {
-        if pin >= 30 {
+        if pin >= Self::BANK0_PINS {
             return;
         }
         self.gpio_out ^= 1u32 << pin;
@@ -300,14 +311,14 @@ impl Sio {
     // Per-bit output-enable (GPIO_OE) operations.
 
     pub fn gpio_bit_oe_get(&self, pin: u8) -> bool {
-        if pin >= 30 {
+        if pin >= Self::BANK0_PINS {
             return false;
         }
         (self.gpio_oe >> pin) & 1 != 0
     }
 
     pub fn gpio_bit_oe_put(&mut self, pin: u8, v: bool) {
-        if pin >= 30 {
+        if pin >= Self::BANK0_PINS {
             return;
         }
         let mask = 1u32 << pin;
@@ -319,21 +330,21 @@ impl Sio {
     }
 
     pub fn gpio_bit_oe_set(&mut self, pin: u8) {
-        if pin >= 30 {
+        if pin >= Self::BANK0_PINS {
             return;
         }
         self.gpio_oe |= 1u32 << pin;
     }
 
     pub fn gpio_bit_oe_clr(&mut self, pin: u8) {
-        if pin >= 30 {
+        if pin >= Self::BANK0_PINS {
             return;
         }
         self.gpio_oe &= !(1u32 << pin);
     }
 
     pub fn gpio_bit_oe_xor(&mut self, pin: u8) {
-        if pin >= 30 {
+        if pin >= Self::BANK0_PINS {
             return;
         }
         self.gpio_oe ^= 1u32 << pin;
